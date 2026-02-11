@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torchmetrics import Accuracy
-
+from utils.Optimizer import OptimWithSheduler
 from utils.dann import DomainDiscriminator, DomainAdversarialLoss
 from utils.meter import OpensetDomainMetric
 from utils.Trainer import Trainer
@@ -10,6 +10,35 @@ from utils.utils import mergeArgs
 from .DCRN import DCRN
 from .Anchor import Anchor
 from .Radius import Radius
+from .HybridEncoder import ResNetTransformer
+import math
+
+def get_scheduler_func(warmup_steps, total_steps, min_lr_ratio=1e-2):
+    """
+    创建一个闭包函数，用于计算每一步的学习率
+    :param warmup_steps: 预热步数 (iterations)
+    :param total_steps: 总训练步数 (iterations)
+    :param min_lr_ratio: 最小学习率与初始学习率的比值
+    """
+    def scheduler_func(step, initial_lr):
+        # 1. Warmup 阶段
+        if step < warmup_steps:
+            return initial_lr * (step / max(1, warmup_steps))
+        
+        # 2. Cosine Annealing 阶段
+        # 进度从 0 到 1
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        progress = min(1.0, max(0.0, progress)) # 截断防止越界
+        
+        # 余弦衰减公式: 0.5 * (1 + cos(pi * progress))
+        # 范围从 1.0 降到 0.0
+        cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+        
+        # 映射到 [min_lr, initial_lr]
+        current_lr = initial_lr * (min_lr_ratio + (1 - min_lr_ratio) * cosine_decay)
+        return current_lr
+        
+    return scheduler_func
 
 class Model(nn.Module):
     def __init__(self, args, source_info, target_info, device, in_channels, patch, known_num_classes, anchor_type, radius_loss_type, radius_init, radius_margin, alpha, domain_loss_weight, radius_loss_weight, pseudo_label_weight, pseudo_label_threshold):
@@ -29,7 +58,8 @@ class Model(nn.Module):
         self.pseudo_label_weight = pseudo_label_weight
         self.pseudo_label_threshold = pseudo_label_threshold
 
-        self.feature_encoder = DCRN(in_channels, patch, known_num_classes)
+        # self.feature_encoder = DCRN(in_channels, patch, known_num_classes)
+        self.feature_encoder = ResNetTransformer(in_channels=in_channels, patch_size=patch)
         self.classifier = nn.Linear(288, known_num_classes)
         self.disc_encoder = DomainDiscriminator(in_feature=288, hidden_size=64)
         self.domain_adv = DomainAdversarialLoss(self.disc_encoder)
@@ -49,12 +79,15 @@ class Model(nn.Module):
         return loss
 
     def pre_train_optimizer(self):
-        optimizer = torch.optim.SGD([
+        # 预训练通常 epoch 较少，可以使用简单的 AdamW
+        optimizer = torch.optim.AdamW([
             {'params': self.feature_encoder.parameters()},
             {'params': self.classifier.parameters()},
             {'params': self.anchor.parameters()}
-        ], lr=0.001, momentum=0.9, weight_decay=5e-4)
+        ], lr=0.001, weight_decay=1e-2)
 
+        # 如果想加调度器也可以加，不想加直接返回 optimizer 也是兼容的
+        # (Trainer 会自动识别 list/tuple 或单个 optimizer)
         return optimizer
 
     def train_step(self, batch):
@@ -67,9 +100,26 @@ class Model(nn.Module):
         gamma = target_out['gamma']
         distance = target_out['distance']
         
+            # 计算目标域的 Softmax 概率
+        # 注意：我们用 Anchor 计算出的距离转成 logits
+        # 距离越小，相似度越高。logits = -distance (近似)
+        target_logits = -target_out['distance'] 
+        target_probs = torch.softmax(target_logits, dim=1)
+        
+        # 计算熵: H(p) = - sum(p * log(p))
+        entropy = -torch.sum(target_probs * torch.log(target_probs + 1e-6), dim=1)
+        
+        # 熵正则化 Loss: 我们希望熵越大越好（对目标域不确定），所以我们要最小化 -entropy
+        # 权重设为 0.1 左右
+        loss_entropy = -0.1 * torch.mean(entropy)
+
         min_gamma = gamma.min(1)[0]
         min_distance = distance.min(1)[0].detach()
-        weight = (min_distance.max() - min_distance) / (min_distance.max() - min_distance.min() + 1e-6)
+        # weight = (min_distance.max() - min_distance) / (min_distance.max() - min_distance.min() + 1e-6)
+        weight = torch.exp(-min_distance / 2.0) # 温度系数 2.0 可调
+    
+        # 归一化到 0-1 (可选，为了数值稳定)
+        weight = (weight - weight.min()) / (weight.max() - weight.min() + 1e-6)
 
         loss_disc = self.domain_adv(source_out['features'], target_out['features'], w_t=weight)
         loss_radius = self.radius(min_gamma.detach(), weight=weight)
@@ -86,8 +136,26 @@ class Model(nn.Module):
             score, pseudo_labels = torch.min(gamma, 1) 
             
             radius_value = self.radius.radius.item()
-            # 筛选条件：gamma 小于半径 (已知类) 且 gamma 小于严格阈值 (高置信)
-            confident_mask = (score < radius_value) & (score < self.pseudo_label_threshold)
+
+            # === 修改：更严格的筛选 ===
+            # 1. 动态半径过滤 (原逻辑保留)
+            cond1 = score < radius_value
+            
+            # 2. 绝对距离阈值 (根据 scale=16.0 调整，可能需要设为 5.0 或更小)
+            # 或者使用相对比例：只取 batch 中距离最近的前 50%
+            cond2 = score < self.pseudo_label_threshold # 确保这个阈值是合理的
+            
+            # 3. (新增建议) 次小距离/最小距离 > 1.2 (Ratio Test)
+            # 如果样本到最近两个锚点的距离差不多，说明它位于决策边界，容易出错 -> 丢弃
+            values, indices = torch.topk(distance, k=2, largest=False, dim=1)
+            ratio = values[:, 1] / (values[:, 0] + 1e-6)
+            cond3 = ratio > 1.2 # 只有当最近的比次近的显著更近时才要
+            
+            confident_mask = cond1 & cond2 & cond3
+
+            # # 筛选条件：gamma 小于半径 (已知类) 且 gamma 小于严格阈值 (高置信)
+            # confident_mask = (score < radius_value) & (score < self.pseudo_label_threshold)
+
             num_pseudo = confident_mask.sum().item()
 
         # 2. 计算伪标签损失
@@ -128,7 +196,8 @@ class Model(nn.Module):
             loss_tuplet = source_out['loss_tuplet'],
             loss_disc = loss_disc * self.domain_loss_weight,
             loss_radius = loss_radius * self.radius_loss_weight,
-            loss_pseudo = loss_pseudo * self.pseudo_label_weight
+            loss_pseudo = loss_pseudo * self.pseudo_label_weight,
+            loss_entropy = loss_entropy
         )
 
         self.source_oa.update(source_out['prediction'], source_y)
@@ -152,18 +221,80 @@ class Model(nn.Module):
 
         return dic
 
-    def train_optimizer(self):
-        momentum = 0.9
-        l2_decay = 5e-4
-        optimizer = torch.optim.SGD([
-            {'params': self.feature_encoder.parameters()},
-            {'params': self.classifier.parameters()},
-            {'params': self.anchor.parameters()}
-        ], lr=self.args.lr_encoder, momentum=momentum, weight_decay=l2_decay)
-        optimizer_critic = torch.optim.SGD(self.disc_encoder.parameters(), lr=self.args.lr_domain, momentum=momentum, weight_decay=l2_decay)
-        optimizer_raiuds = torch.optim.SGD(self.radius.parameters(), lr=1e-4, momentum=momentum, weight_decay=l2_decay)
 
-        return optimizer, optimizer_critic, optimizer_raiuds
+    # 在 Model 类中修改 train_optimizer 方法
+    def train_optimizer(self):
+        # --- 1. 参数设置 ---
+        # AdamW 对 Weight Decay 的处理不同，通常设为 1e-2 或 1e-4
+        weight_decay = 1e-2 
+        
+        # 估算总步数 (用于 Cosine 调度)
+        # 假设每个 Epoch 迭代次数由源域数据量决定 (WGDT 逻辑)
+        # train_num 默认为 180 (小样本)，batch=32 -> 约 6 steps/epoch ?? 
+        # 等等，DataLoader 里 drop_last=True。
+        # 如果数据量很小，steps 会很少。我们保守估计：
+        # 建议：直接给一个固定的 total_steps 或者根据 args 算
+        n_samples = max(self.args.train_num, getattr(self.args, 'few_train_num', 150))
+        steps_per_epoch = max(1, n_samples // self.args.batch)
+        total_steps = self.args.epochs * steps_per_epoch
+        
+        # Warmup 设置为总步数的 10%
+        warmup_steps = int(total_steps * 0.1)
+        
+        # 创建调度策略函数 (复用上面定义的函数)
+        scheduler_fn = get_scheduler_func(warmup_steps, total_steps)
+
+        # --- 2. 优化器定义 (AdamW) ---
+        
+        # (A) 特征提取器 & 分类器 & Anchor
+        # 区分 Transformer 和 ResNet 的参数 (差异化学习率)
+        transformer_params = []
+        base_params = []
+        
+        # 假设你已经使用了我之前提供的 ResNetTransformer
+        if hasattr(self.feature_encoder, 'named_parameters'):
+            for name, param in self.feature_encoder.named_parameters():
+                if 'transformer' in name:
+                    transformer_params.append(param)
+                else:
+                    base_params.append(param)
+        else:
+            base_params = list(self.feature_encoder.parameters())
+
+        optimizer_main = torch.optim.AdamW([
+            # ResNet 部分
+            {'params': base_params, 'lr': self.args.lr_encoder},
+            # Transformer 部分：学习率 0.1 倍，防止过拟合
+            {'params': transformer_params, 'lr': self.args.lr_encoder * 0.1},
+            # 分类器 & Anchor
+            {'params': self.classifier.parameters(), 'lr': self.args.lr_encoder},
+            {'params': self.anchor.parameters(), 'lr': self.args.lr_encoder}
+        ], weight_decay=weight_decay)
+
+        # (B) 域判别器
+        optimizer_critic = torch.optim.AdamW(
+            self.disc_encoder.parameters(), 
+            lr=self.args.lr_domain, 
+            weight_decay=weight_decay
+        )
+
+        # (C) Radius (动态半径)
+        # Radius 对 LR 敏感，AdamW 通常比 SGD 更稳，但 LR 仍需由调度器控制
+        optimizer_radius = torch.optim.AdamW(
+            self.radius.parameters(), 
+            lr=1e-3, # AdamW 通常可以用比 SGD 大一点的初始 LR，或者保持 1e-4
+            weight_decay=weight_decay
+        )
+
+        # --- 3. 包装调度器 ---
+        # 使用 utils.Optimizer.OptimWithSheduler 包装
+        # 这样 Trainer 调用 .step() 时会自动更新 LR
+        
+        op_main_scheduled = OptimWithSheduler(optimizer_main, scheduler_fn)
+        op_critic_scheduled = OptimWithSheduler(optimizer_critic, scheduler_fn)
+        op_radius_scheduled = OptimWithSheduler(optimizer_radius, scheduler_fn)
+
+        return op_main_scheduled, op_critic_scheduled, op_radius_scheduled
 
     def test_step(self, batch):
         x, y = batch
@@ -198,7 +329,9 @@ class Model(nn.Module):
         drawPredictionMap(self.prediciton_all, f'{self.args.log_name} {self.args.target_dataset}', self.target_info, known_classes=self.args.target_known_classes, unknown_classes=self.args.target_unknown_classes, draw_background=False)
 
     def forward(self, x, y=None):
-        features = self.feature_encoder(x)['features']
+        # features = self.feature_encoder(x)['features']
+        out_dict = self.feature_encoder(x)
+        features = out_dict['features']
         logits = self.classifier(features)
         anchor_out = self.anchor(logits, y)
 
@@ -258,7 +391,7 @@ def parse_args():
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--train_num', type=int, default=180)
     parser.add_argument('--few_train_num', type=int, default=150)
-    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--seed', type=int, default=2)
     parser.add_argument('--batch', type=int, default=32)
     parser.add_argument('--patch', type=int, default=7)
     parser.add_argument('--epochs', type=int, default=150)
