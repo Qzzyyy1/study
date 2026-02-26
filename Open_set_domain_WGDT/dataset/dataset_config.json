@@ -9,7 +9,9 @@
         "image_width": 210,
         "image_height": 954,
         "bands_num": 48,
-        "num_classes": 7
+        "num_classes": 7,
+        "pseudo_label_weight": 0.1,
+        "pseudo_label_threshold":0.4
     },
     "PaviaU_7gt": {
         "path": "Pavia_7gt",

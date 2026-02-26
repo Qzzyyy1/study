@@ -391,7 +391,7 @@ def parse_args():
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--train_num', type=int, default=180)
     parser.add_argument('--few_train_num', type=int, default=150)
-    parser.add_argument('--seed', type=int, default=2)
+    parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--batch', type=int, default=32)
     parser.add_argument('--patch', type=int, default=7)
     parser.add_argument('--epochs', type=int, default=150)

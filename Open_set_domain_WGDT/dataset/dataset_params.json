@@ -8,8 +8,9 @@
         "alpha": 0.01,
         "domain_loss_weight": 1.5,
         "radius_loss_weight": 0.1,
+        "radius_init": 1.0,
         "anchor_weight": 12,
-        "radius_margin": 0.3
+        "radius_margin": 0.5
     },
     "Houston18_OS": {
         "lr_encoder": 0.001,
