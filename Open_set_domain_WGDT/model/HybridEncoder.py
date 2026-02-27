@@ -107,7 +107,7 @@ class ResNetTransformer(nn.Module):
         # --- C. 零初始化残差融合 (Safest Fusion) ---
         # 因为 self.spectral_gate 初始化为 0，所以初始状态 features = spatial_features
         # 随着训练，优化器会自动调整 gate 的大小，吸纳对分类有用的光谱信息
-        features = spatial_features + self.spectral_gate * spectral_features
+        features = spatial_features + (self.spectral_gate * 0.6 ) * spectral_features
 
         # --- D. 球面保护 ---
         features = F.normalize(features, p=2, dim=1) * 16.0

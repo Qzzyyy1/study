@@ -7,6 +7,7 @@ import os
 import json
 import subprocess
 import argparse
+import re
 from datetime import datetime
 from itertools import product
 import numpy as np
@@ -17,6 +18,8 @@ class HyperparameterSearch:
         self.search_mode = search_mode
         self.results = []
         self.log_file = f'hyperparam_search_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
+        # 创建一个总的 debug 日志，而不是每个 trial 建一个新文件
+        self.debug_file = f'output_debug_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
         
     def grid_search(self, param_grid):
         """网格搜索：遍历所有参数组合"""
@@ -95,7 +98,7 @@ class HyperparameterSearch:
             )
             
             # 解析结果
-            metrics = self.parse_output(result.stdout)
+            metrics = self.parse_output(result.stdout, trial_id)
             
             experiment_result = {
                 'trial_id': trial_id,
@@ -111,6 +114,8 @@ class HyperparameterSearch:
                     print(f"  {k}: {v:.4f}")
             else:
                 print("  未能解析到结果指标")
+                if result.returncode != 0:
+                    print(f"  错误信息摘要: {result.stderr[:200]}...")
             
             return experiment_result
             
@@ -134,40 +139,36 @@ class HyperparameterSearch:
                 'timestamp': datetime.now().isoformat()
             }
     
-    def parse_output(self, output):
+    def parse_output(self, output, trial_id):
         """从输出中解析性能指标 - 增强版"""
-        import re
         metrics = {}
         
-        # 保存完整输出到文件，方便调试
-        debug_file = f'output_debug_{datetime.now().strftime("%Y%m%d_%H%M%S")}.txt'
-        with open(debug_file, 'w', encoding='utf-8') as f:
+        # 将完整输出追加到总的 debug 文件中，而不是每次新建文件
+        with open(self.debug_file, 'a', encoding='utf-8') as f:
+            f.write(f"\n{'='*20} Trial {trial_id} {'='*20}\n")
             f.write(output)
+            f.write("\n")
         
         lines = output.split('\n')
         
-        # 模式1: 查找 "指标名: 数值" 格式
+        # 模式1: 查找 "指标名: 数值" 格式 (将正则和指标名称绑定)
+        patterns = [
+            ('OS*', r'OS\*[:\s]+([0-9.]+)'),
+            ('OS', r'OS[:\s]+([0-9.]+)'),
+            ('H-score', r'H-score[:\s]+([0-9.]+)'),
+            ('h-score', r'h-score[:\s]+([0-9.]+)'),
+            ('accuracy', r'accuracy[:\s]+([0-9.]+)'),
+            ('Accuracy', r'Accuracy[:\s]+([0-9.]+)'),
+            ('known_acc', r'known[_\s]acc[:\s]+([0-9.]+)'),
+            ('unknown_acc', r'unknown[_\s]acc[:\s]+([0-9.]+)'),
+            ('target_acc', r'target[_\s]acc[:\s]+([0-9.]+)'),
+        ]
+        
         for line in lines:
-            # OS*, OS, H-score等常见指标
-            patterns = [
-                r'OS\*[:\s]+([0-9.]+)',           # OS*: 0.8523 或 OS* 0.8523
-                r'OS[:\s]+([0-9.]+)',             # OS: 0.8523
-                r'H-score[:\s]+([0-9.]+)',        # H-score: 0.8523
-                r'h-score[:\s]+([0-9.]+)',        # h-score: 0.8523
-                r'accuracy[:\s]+([0-9.]+)',       # accuracy: 0.9012
-                r'Accuracy[:\s]+([0-9.]+)',       # Accuracy: 0.9012
-                r'known[_\s]acc[:\s]+([0-9.]+)',  # known_acc: 0.9012
-                r'unknown[_\s]acc[:\s]+([0-9.]+)',# unknown_acc: 0.8012
-                r'target[_\s]acc[:\s]+([0-9.]+)', # target_acc: 0.8523
-            ]
-            
-            for pattern in patterns:
+            for metric_name, pattern in patterns:
                 match = re.search(pattern, line, re.IGNORECASE)
                 if match:
-                    value = float(match.group(1))
-                    # 提取指标名称
-                    metric_name = re.search(r'([a-zA-Z*_-]+)', pattern.replace('[:\\s]+', '').replace('([0-9.]+)', '')).group(1)
-                    metrics[metric_name] = value
+                    metrics[metric_name] = float(match.group(1))
         
         # 模式2: 查找表格格式的输出
         # 例如: | OS* | 0.8523 |
@@ -179,7 +180,7 @@ class HyperparameterSearch:
                         metric_name = parts[0]
                         metric_value = float(parts[1])
                         metrics[metric_name] = metric_value
-                    except:
+                    except ValueError:
                         pass
         
         # 模式3: 查找最后几行的数字（通常是最终结果）
@@ -188,7 +189,6 @@ class HyperparameterSearch:
             # 查找所有浮点数
             numbers = re.findall(r'\b([0-9]+\.[0-9]+)\b', line)
             if numbers and any(keyword in line.lower() for keyword in ['test', 'final', 'result', 'performance']):
-                # 如果这行包含关键词，尝试提取指标
                 for num in numbers:
                     value = float(num)
                     if 0 < value <= 1:  # 假设指标在0-1之间
@@ -206,7 +206,7 @@ class HyperparameterSearch:
                 'results': self.results,
                 'best_result': self.get_best_result() if self.results else None
             }, f, indent=2, ensure_ascii=False)
-        print(f"\n结果已保存到: {self.log_file}")
+        # 不再每次打印保存路径，保持控制台整洁
     
     def get_best_result(self):
         """获取最佳结果"""
@@ -228,6 +228,8 @@ class HyperparameterSearch:
                 return metrics['OS']
             elif 'accuracy' in metrics:
                 return metrics['accuracy']
+            elif 'H-score' in metrics:
+                return metrics['H-score']
             elif 'h-score' in metrics:
                 return metrics['h-score']
             else:
@@ -255,15 +257,18 @@ class HyperparameterSearch:
         if best:
             print("\n" + "🏆 最佳参数组合:")
             print("-" * 60)
+            # 修复了这里的解包错误
             for k, v in best['params'].items():
                 print(f"  {k}: {v}")
             print("\n性能指标:")
+            # 修复了这里的解包错误
             for k, v in best['metrics'].items():
                 print(f"  {k}: {v:.4f}")
         else:
             print("\n未找到有效的最佳结果")
         
         print(f"\n详细结果已保存到: {self.log_file}")
+        print(f"控制台输出日志保存在: {self.debug_file}")
 
 
 def main():
@@ -276,10 +281,10 @@ def main():
                         help='随机搜索的试验次数')
     
     # 基础参数（不参与搜索）
-    parser.add_argument('--source_dataset', type=str, default='PaviaU_7gt')
-    parser.add_argument('--target_dataset', type=str, default='PaviaC_OS')
+    parser.add_argument('--source_dataset', type=str, default='Houston13_7gt')
+    parser.add_argument('--target_dataset', type=str, default='Houston18_OS')
     parser.add_argument('--device', type=int, default=0)
-    parser.add_argument('--epochs', type=int, default=150)
+    parser.add_argument('--epoch', type=int, default=150)
     parser.add_argument('--seed', type=int, default=0)
     
     args = parser.parse_args()
@@ -299,11 +304,14 @@ def main():
     if args.search_mode == 'grid':
         # 网格搜索的参数空间
         param_grid = {
-            'pseudo_label_weight': [0.3, 0.5, 0.7, 1.0],
-            'pseudo_label_threshold': [0.1, 0.2, 0.3, 0.4, 0.5]
+            'pseudo_label_weight': [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+            'pseudo_label_threshold': [0.1, 0.2, 0.3, 0.4, 0.5],
+            "radius_init": [0.1, 0.2, 0.3, 0.4, 0.5],
+            "radius_margin": [0.01, 0.05, 0.10, 0.15, 0.20, 0.3, 0.4]
         }
         
         print("网格搜索参数空间:")
+        # 修复了这里的解包错误
         for k, v in param_grid.items():
             print(f"  {k}: {v}")
         
@@ -328,4 +336,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
