@@ -96,90 +96,98 @@ class Model(nn.Module):
         source_out = self(source_x, source_y)
         target_out = self(target_x)
 
+        # 获取 gamma (用于筛选) 和 distance (用于计算损失)
         gamma = target_out['gamma']
         distance = target_out['distance']
         
-        min_gamma = gamma.min(1)[0]
-        # 注意：这里去掉了 detach，因为我们需要对未知类的距离求导来产生“推力”
-        min_distance = distance.min(1)[0] 
-        
-        radius_value = self.radius.radius.item()
-
-        # ==========================================
-        # 核心模块 1：严格的已知/未知分离 (Separation)
-        # ==========================================
-        # 引入缓冲系数：小于半径认为是已知，大于 1.1 倍半径认为是极其确定的未知
-        known_mask = min_gamma < radius_value
-        unknown_mask = min_gamma > (radius_value * 1.1)
-
-        # ==========================================
-        # 核心模块 2：DANN Gating (彻底屏蔽未知类)
-        # ==========================================
-        # 初始化全 0 权重，只有被确认为已知类的样本才给予域对抗权重
-        weight = torch.zeros_like(min_gamma)
-        weight[known_mask] = torch.exp(-min_gamma[known_mask].detach() / 2.0)
-        
-        # 将干净的权重传入 DANN 和 Radius，未知类不再污染域判别器和边界半径
-        loss_disc = self.domain_adv(source_out['features'], target_out['features'], w_t=weight.detach())
-        loss_radius = self.radius(min_gamma.detach(), weight=weight.detach())
-
-        # ==========================================
-        # 核心模块 3：未知类的主动排斥与熵最大化 (Active Push & Entropy Max)
-        # ==========================================
-        target_logits = -distance 
+            # 计算目标域的 Softmax 概率
+        # 注意：我们用 Anchor 计算出的距离转成 logits
+        # 距离越小，相似度越高。logits = -distance (近似)
+        target_logits = -target_out['distance'] 
         target_probs = torch.softmax(target_logits, dim=1)
+        
+        # 计算熵: H(p) = - sum(p * log(p))
         entropy = -torch.sum(target_probs * torch.log(target_probs + 1e-6), dim=1)
         
-        loss_unknown = torch.tensor(0.0, device=self.device)
-        if unknown_mask.sum() > 0:
-            # a) 距离排斥 (Push Loss)：强迫未知类样本距离最近的已知类 Anchor 至少达到 1.5 倍的边界半径
-            margin_push = radius_value * 1.5
-            loss_push = torch.mean(torch.relu(margin_push - min_distance[unknown_mask]))
-            
-            # b) 熵最大化 (Entropy Max)：强迫未知类在已知类上的预测分布趋于均匀（即不偏袒、不属于任何已知类）
-            # 加上负号即为最小化负熵（最大化熵）
-            loss_entropy = -0.1 * torch.mean(entropy[unknown_mask])
-            
-            # 综合未知类损失
-            loss_unknown = loss_push + loss_entropy
+        # 熵正则化 Loss: 我们希望熵越大越好（对目标域不确定），所以我们要最小化 -entropy
+        # 权重设为 0.1 左右
+        loss_entropy = -0.1 * torch.mean(entropy)
 
-        # ==========================================
-        # 4. 伪标签自训练 (仅限极高置信度的已知类)
-        # ==========================================
+        min_gamma = gamma.min(1)[0]
+        min_distance = distance.min(1)[0].detach()
+        # weight = (min_distance.max() - min_distance) / (min_distance.max() - min_distance.min() + 1e-6)
+        weight = torch.exp(-min_distance / 2.0) # 温度系数 2.0 可调
+    
+        # 归一化到 0-1 (可选，为了数值稳定)
+        weight = (weight - weight.min()) / (weight.max() - weight.min() + 1e-6)
+
+        loss_disc = self.domain_adv(source_out['features'], target_out['features'], w_t=weight)
+        loss_radius = self.radius(min_gamma.detach(), weight=weight)
+
+        # ========== 伪标签自训练（基于度量学习） ==========
         loss_pseudo = torch.tensor(0.0, device=self.device)
         loss_pseudo_anchor = torch.tensor(0.0, device=self.device)
         loss_pseudo_tuplet = torch.tensor(0.0, device=self.device)
         num_pseudo = 0
 
+        # 1. 筛选高置信度的已知类样本
         with torch.no_grad():
+            # ✅ 修改 1: 使用 gamma 作为置信度评分，与测试阶段保持一致
             score, pseudo_labels = torch.min(gamma, 1) 
-            # 严格筛选：1.必须在已知类掩码内 2.小于伪标签严格阈值 3.满足比率测试(避免模棱两可)
-            cond1 = known_mask
-            cond2 = score < self.pseudo_label_threshold 
             
+            radius_value = self.radius.radius.item()
+
+            # === 修改：更严格的筛选 ===
+            # 1. 动态半径过滤 (原逻辑保留)
+            cond1 = score < radius_value
+            
+            # 2. 绝对距离阈值 (根据 scale=16.0 调整，可能需要设为 5.0 或更小)
+            # 或者使用相对比例：只取 batch 中距离最近的前 50%
+            cond2 = score < self.pseudo_label_threshold # 确保这个阈值是合理的
+            
+            # 3. (新增建议) 次小距离/最小距离 > 1.2 (Ratio Test)
+            # 如果样本到最近两个锚点的距离差不多，说明它位于决策边界，容易出错 -> 丢弃
             values, indices = torch.topk(distance, k=2, largest=False, dim=1)
             ratio = values[:, 1] / (values[:, 0] + 1e-6)
-            cond3 = ratio > 1.2 
+            cond3 = ratio > 1.2 # 只有当最近的比次近的显著更近时才要
             
             confident_mask = cond1 & cond2 & cond3
+
+            # # 筛选条件：gamma 小于半径 (已知类) 且 gamma 小于严格阈值 (高置信)
+            # confident_mask = (score < radius_value) & (score < self.pseudo_label_threshold)
+
             num_pseudo = confident_mask.sum().item()
 
+        # 2. 计算伪标签损失
         if num_pseudo > 0:
+            # 获取对应的距离矩阵 (Batch_Pseudo, Num_Classes)
+            # 注意：虽然筛选用 gamma，但计算损失必须用 distance
             confident_distances = distance[confident_mask]
             confident_pseudo_labels = pseudo_labels[confident_mask]
 
-            # Anchor Loss (Pull)
+            # --- A. Anchor Loss ---
+            # 获取样本到其“伪标签锚点”的距离
             true_distances = torch.gather(confident_distances, 1, confident_pseudo_labels.view(-1, 1)).view(-1)
             loss_pseudo_anchor = torch.mean(true_distances)
 
-            # Tuplet Loss
+            # --- B. Tuplet Loss (向量化优化版) ---
+            # ✅ 修改 2: 移除列表推导式，使用掩码屏蔽掉 true_class
+            # 创建一个全 1 掩码
             mask = torch.ones_like(confident_distances, dtype=torch.bool)
+            # 将 true class 的位置设为 False
             mask.scatter_(1, confident_pseudo_labels.view(-1, 1), False)
+            
+            # 选出非伪标签类别的距离 (Flatten 后 reshape)
+            # Shape: [Num_Pseudo, Num_Classes - 1]
             other_distances = confident_distances[mask].view(num_pseudo, -1)
 
+            # 计算 Tuplet 公式: log(1 + sum(exp(true - other)))
+            # true_distances.unsqueeze(1) shape: [Num_Pseudo, 1]
+            # other_distances shape: [Num_Pseudo, Num_Classes - 1]
             tuplet = torch.exp(true_distances.unsqueeze(1) - other_distances)
             loss_pseudo_tuplet = torch.mean(torch.log(1 + torch.sum(tuplet, dim=1)))
 
+            # 汇总伪标签损失
             loss_pseudo = self.alpha * loss_pseudo_anchor + loss_pseudo_tuplet
 
         # ========== 损失汇总 ==========
@@ -189,7 +197,7 @@ class Model(nn.Module):
             loss_disc = loss_disc * self.domain_loss_weight,
             loss_radius = loss_radius * self.radius_loss_weight,
             loss_pseudo = loss_pseudo * self.pseudo_label_weight,
-            loss_unknown = loss_unknown * 0.5  # 引入新模块的损失权重
+            loss_entropy = loss_entropy
         )
 
         self.source_oa.update(source_out['prediction'], source_y)
@@ -199,9 +207,9 @@ class Model(nn.Module):
             'information': {
                 **loss_dic, 
                 'num_pseudo': num_pseudo,
+                # 为了防止 log 报错，转换一下 tensor
                 'loss_pseudo_anchor': loss_pseudo_anchor.item(),
-                'loss_pseudo_tuplet': loss_pseudo_tuplet.item(),
-                'radius_val': radius_value # 监控半径变化
+                'loss_pseudo_tuplet': loss_pseudo_tuplet.item()
             }
         }
     
@@ -383,7 +391,7 @@ def parse_args():
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--train_num', type=int, default=180)
     parser.add_argument('--few_train_num', type=int, default=150)
-    parser.add_argument('--seed', type=int, default=1)
+    parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--batch', type=int, default=32)
     parser.add_argument('--patch', type=int, default=7)
     parser.add_argument('--epochs', type=int, default=150)
@@ -401,8 +409,6 @@ def parse_args():
     # 伪标签自训练参数
     parser.add_argument('--pseudo_label_weight', type=float, default=0.5, help='伪标签损失权重')
     parser.add_argument('--pseudo_label_threshold', type=float, default=0.3, help='伪标签置信度阈值（距离）')
-
-    # 动态修改
 
     args = parser.parse_args()
 
