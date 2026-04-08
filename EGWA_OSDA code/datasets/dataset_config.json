@@ -1,0 +1,52 @@
+{
+    "Houston13_7gt": {
+        "path": "Houston_7gt",
+        "norm": true,
+        "file_name": "Houston13.mat",
+        "mat_name": "ori_data",
+        "gt_file_name": "Houston13_7gt.mat",
+        "gt_mat_name": "map",
+        "image_width": 210,
+        "image_height": 954,
+        "bands_num": 48,
+        "num_classes": 7,
+        "url": []
+    },
+    "Houston18_7gt": {
+        "path": "Houston_7gt",
+        "norm": true,
+        "file_name": "Houston18.mat",
+        "mat_name": "ori_data",
+        "gt_file_name": "Houston18_7gt.mat",
+        "gt_mat_name": "map",
+        "image_width": 210,
+        "image_height": 954,
+        "bands_num": 48,
+        "num_classes": 7,
+        "url": []
+    },
+    "PaviaU_7gt": {
+        "path": "Pavia_7gt",
+        "file_name": "paviaU.mat",
+        "mat_name": "paviaU",
+        "gt_file_name": "paviaU_gt_7.mat",
+        "gt_mat_name": "paviaU_gt_7",
+        "image_width": 610,
+        "image_height": 340,
+        "bands_num": 102,
+        "num_classes": 7,
+        "url": []
+    },
+
+    "PaviaC_OS": {
+        "path": "PaviaC",
+        "type": "npy",
+        "file_name": "PaviaC_OS.npy",
+        "gt_file_name": "PaviaC_OS_gt.npy",
+        "image_width": 1096,
+        "image_height": 715,
+        "bands_num": 102,
+        "num_classes": 9,
+        "url": []
+    }
+}
