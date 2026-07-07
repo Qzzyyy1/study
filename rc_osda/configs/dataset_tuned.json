@@ -1,0 +1,38 @@
+{
+  "PaviaC_OS": {
+    "ova_loss_weight": 1.0,
+    "open_entropy_weight": 0.15,
+    "ova_threshold": 0.6,
+    "consistency_loss_weight": 0.15,
+    "consistency_threshold": 0.7,
+    "feature_noise_std": 0.05,
+    "density_quantile": 0.02,
+    "rescue_margin": 0.2,
+    "variance_floor": 0.001,
+    "teacher_momentum": 0.999
+  },
+  "Houston18_OS": {
+    "ova_loss_weight": 1.0,
+    "open_entropy_weight": 0.1,
+    "ova_threshold": 0.55,
+    "consistency_loss_weight": 0.02,
+    "consistency_threshold": 0.9,
+    "feature_noise_std": 0.05,
+    "density_quantile": 0.02,
+    "rescue_margin": 0.03,
+    "variance_floor": 1e-05,
+    "teacher_momentum": 0.999
+  },
+  "Honghu_OS": {
+    "ova_loss_weight": 1.0,
+    "open_entropy_weight": 0.0,
+    "ova_threshold": 0.55,
+    "consistency_loss_weight": 0.1,
+    "consistency_threshold": 0.85,
+    "feature_noise_std": 0.03,
+    "density_quantile": 0.02,
+    "rescue_margin": 0.03,
+    "variance_floor": 1e-05,
+    "teacher_momentum": 0.999
+  }
+}
